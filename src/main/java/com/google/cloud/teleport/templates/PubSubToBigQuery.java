@@ -44,7 +44,6 @@ import org.apache.beam.sdk.io.gcp.bigquery.WriteResult;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessage;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessageWithAttributesCoder;
-import org.apache.beam.sdk.options.Default;
 import org.apache.beam.sdk.options.Description;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
@@ -58,6 +57,7 @@ import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.POutput;
 import org.apache.beam.sdk.values.TupleTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,8 +83,6 @@ import org.slf4j.LoggerFactory;
  * PROJECT_ID=PROJECT ID HERE
  * BUCKET_NAME=BUCKET NAME HERE
  * PIPELINE_FOLDER=gs://${BUCKET_NAME}/dataflow/pipelines/pubsub-to-bigquery
- * USE_SUBSCRIPTION=true or false depending on whether the pipeline should read
- *                  from a Pub/Sub Subscription or a Pub/Sub Topic.
  *
  * # Set the runner
  * RUNNER=DataflowRunner
@@ -98,30 +96,18 @@ import org.slf4j.LoggerFactory;
  * --stagingLocation=${PIPELINE_FOLDER}/staging \
  * --tempLocation=${PIPELINE_FOLDER}/temp \
  * --templateLocation=${PIPELINE_FOLDER}/template \
- * --runner=${RUNNER}
- * --useSubscription=${USE_SUBSCRIPTION}
- * "
+ * --runner=${RUNNER}"
  *
  * # Execute the template
  * JOB_NAME=pubsub-to-bigquery-$USER-`date +"%Y%m%d-%H%M%S%z"`
  *
- * # Execute a pipeline to read from a Topic.
  * gcloud dataflow jobs run ${JOB_NAME} \
  * --gcs-location=${PIPELINE_FOLDER}/template \
  * --zone=us-east1-d \
  * --parameters \
- * "inputTopic=projects/${PROJECT_ID}/topics/input-topic-name,\
- * outputTableSpec=${PROJECT_ID}:dataset-id.output-table,\
- * outputDeadletterTable=${PROJECT_ID}:dataset-id.deadletter-table"
- *
- * # Execute a pipeline to read from a Subscription.
- * gcloud dataflow jobs run ${JOB_NAME} \
- * --gcs-location=${PIPELINE_FOLDER}/template \
- * --zone=us-east1-d \
- * --parameters \
- * "inputSubscription=projects/${PROJECT_ID}/subscriptions/input-subscription-name,\
- * outputTableSpec=${PROJECT_ID}:dataset-id.output-table,\
- * outputDeadletterTable=${PROJECT_ID}:dataset-id.deadletter-table"
+ * "inputTopic=projects/data-analytics-pocs/topics/teleport-pubsub-to-bigquery,\
+ * outputTableSpec=data-analytics-pocs:demo.pubsub_to_bigquery,\
+ * outputDeadletterTable=data-analytics-pocs:demo.pubsub_to_bigquery_deadletter"
  * </pre>
  */
 public class PubSubToBigQuery {
@@ -170,6 +156,11 @@ public class PubSubToBigQuery {
 
     void setInputTopic(ValueProvider<String> value);
 
+    @Description("Pub/Sub topic to write the output to")
+    ValueProvider<String> getOutputTopic();
+
+    void setOutputTopic(ValueProvider<String> value);
+
     @Description(
         "The Cloud Pub/Sub subscription to consume from. "
             + "The name should be in the format of "
@@ -180,7 +171,6 @@ public class PubSubToBigQuery {
 
     @Description(
         "This determines whether the template reads from " + "a pub/sub subscription or a topic")
-    @Default.Boolean(false)
     Boolean getUseSubscription();
 
     void setUseSubscription(Boolean value);
@@ -231,6 +221,8 @@ public class PubSubToBigQuery {
      *     - Convert UDF result to TableRow objects
      *  3) Write successful records out to BigQuery
      *  4) Write failed records out to BigQuery
+     *  5) Insert records that failed insert into deadletter table
+     *  6) Write transform message to output pubsub topic
      */
 
     /*
@@ -258,7 +250,7 @@ public class PubSubToBigQuery {
              * Step #2: Transform the PubsubMessages into TableRows
              */
             .apply("ConvertMessageToTableRow", new PubsubMessageToTableRow(options));
-
+    
     /*
      * Step #3: Write the successful records out to BigQuery
      */
@@ -277,7 +269,7 @@ public class PubSubToBigQuery {
                     .to(options.getOutputTableSpec()));
 
     /*
-     * Step 3 Contd.
+     * Step #3: Contd.
      * Elements that failed inserts into BigQuery are extracted and converted to FailsafeElement
      */
     PCollection<FailsafeElement<String, String>> failedInserts =
@@ -309,7 +301,7 @@ public class PubSubToBigQuery {
                 .setErrorRecordsTableSchema(ResourceUtils.getDeadletterTableSchemaJson())
                 .build());
 
-    // 5) Insert records that failed insert into deadletter table
+    // Step 5: Insert records that failed insert into deadletter table
     failedInserts.apply(
         "WriteFailedRecords",
         ErrorConverters.WriteStringMessageErrors.newBuilder()
@@ -320,6 +312,12 @@ public class PubSubToBigQuery {
                     DEFAULT_DEADLETTER_TABLE_SUFFIX))
             .setErrorRecordsTableSchema(ResourceUtils.getDeadletterTableSchemaJson())
             .build());
+    // Step 6: Write transform message to output pubsub topic
+    POutput newMessage =         
+      convertedTableRows
+        .get(UDF_OUT)
+        .apply("ConvertBackToPubSubMessage", ParDo.of(new FailsafeElementToPubsubMessageFn()))
+        .apply("WritePubSubEvents", PubsubIO.writeMessages().to(options.getOutputTopic()));
 
     return pipeline.run();
   }
@@ -427,6 +425,21 @@ public class PubSubToBigQuery {
       PubsubMessage message = context.element();
       context.output(
           FailsafeElement.of(message, new String(message.getPayload(), StandardCharsets.UTF_8)));
+    }
+  }
+
+  /**
+   * The {@link FailsafeElementToPububMessageFn} converts a {@link PubsubMessage} to a
+   * {@link FailsafeElement} class so that the transformed message can be output to a pubsub topic.
+   */
+  static class FailsafeElementToPubsubMessageFn
+      extends DoFn<FailsafeElement<PubsubMessage, String>, PubsubMessage> {
+    @ProcessElement
+    public void processElement(ProcessContext context) {
+      FailsafeElement<PubsubMessage, String> element = context.element();
+      context.output(
+          new PubsubMessage((element.getPayload()).getBytes(),
+                            (element.getOriginalPayload()).getAttributeMap()));
     }
   }
 }
